@@ -69,3 +69,11 @@ or
 ```sh
 ./scripts/run.sh "Who was the president of Yugoslavia?"
 ```
+
+## Sample
+
+
+
+https://github.com/user-attachments/assets/b2abe016-4e15-463c-a962-13f6a75350aa
+
+
