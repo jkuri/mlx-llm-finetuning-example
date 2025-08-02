@@ -1,5 +1,6 @@
 .venv/
 .DS_Store
-data/*
-dataset/*
+dataset/data.csv
+data/*.jsonl
 adapters/*
+!adapters/.gitkeep
