@@ -7,5 +7,5 @@ python -m mlx_lm lora \
   --fine-tune-type lora \
   --batch-size 4 \
   --num-layers 16 \
-  --iters 100 \
+  --iters 500 \
   --adapter-path adapters

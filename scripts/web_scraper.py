@@ -6,12 +6,12 @@ Scrapes website content and saves to CSV format using pandas
 """
 
 import argparse
-import requests
+import asyncio
+import aiohttp
 from bs4 import BeautifulSoup
 import pandas as pd
 import sys
-from urllib.parse import urlparse
-import time
+from urllib.parse import urlparse, urljoin
 import logging
 from typing import List, Dict
 import re
@@ -20,21 +20,39 @@ import re
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class WebScraper:
-    def __init__(self, base_url: str, delay: float = 1.0):
+class AsyncWebScraper:
+    def __init__(self, base_url: str, delay: float = 1.0, max_concurrent: int = 20):
         """
-        Initialize the web scraper
+        Initialize the async web scraper
 
         Args:
             base_url: The base URL to scrape
             delay: Delay between requests in seconds
+            max_concurrent: Maximum number of concurrent requests
         """
         self.base_url = base_url
         self.delay = delay
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        })
+        self.max_concurrent = max_concurrent
+        self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.session = None
+
+    async def __aenter__(self):
+        """Async context manager entry"""
+        connector = aiohttp.TCPConnector(limit=self.max_concurrent)
+        timeout = aiohttp.ClientTimeout(total=30)
+        self.session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+        )
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit"""
+        if self.session:
+            await self.session.close()
 
     def clean_text(self, text: str) -> str:
         """Clean and normalize text content"""
@@ -166,9 +184,9 @@ class WebScraper:
 
         return sections
 
-    def scrape_page(self, url: str) -> List[Dict[str, str]]:
+    async def scrape_page(self, url: str) -> List[Dict[str, str]]:
         """
-        Scrape a single page and extract multiple content sections
+        Scrape a single page asynchronously
 
         Args:
             url: URL to scrape
@@ -176,37 +194,37 @@ class WebScraper:
         Returns:
             List of dictionaries with scraped data sections
         """
-        try:
-            logger.info(f"Scraping: {url}")
-            response = self.session.get(url, timeout=10)
-            response.raise_for_status()
+        async with self.semaphore:
+            try:
+                logger.info(f"Scraping: {url}")
 
-            soup = BeautifulSoup(response.content, 'html.parser')
+                async with self.session.get(url) as response:
+                    response.raise_for_status()
+                    content = await response.read()
 
-            # Remove script and style elements
-            for script in soup(["script", "style", "nav", "footer", "header"]):
-                script.decompose()
+                soup = BeautifulSoup(content, 'html.parser')
 
-            # Extract title
-            title = soup.find('title')
-            title_text = title.get_text().strip() if title else ""
+                # Remove script and style elements
+                for script in soup(["script", "style", "nav", "footer", "header"]):
+                    script.decompose()
 
-            # Extract multiple sections from the page
-            sections = self.extract_sections(soup, url, title_text)
+                # Extract title
+                title = soup.find('title')
+                title_text = title.get_text().strip() if title else ""
 
-            if sections:
-                logger.info(f"Extracted {len(sections)} sections from {url}")
+                # Extract multiple sections from the page
+                sections = self.extract_sections(soup, url, title_text)
+
+                if sections:
+                    logger.info(f"Extracted {len(sections)} sections from {url}")
+
+                # Add delay to be respectful
+                await asyncio.sleep(self.delay)
                 return sections
-            else:
-                logger.warning(f"No sections extracted from {url}")
-                return []
 
-        except requests.RequestException as e:
-            logger.error(f"Error scraping {url}: {e}")
-            return []
-        except Exception as e:
-            logger.error(f"Unexpected error scraping {url}: {e}")
-            return []
+            except Exception as e:
+                logger.error(f"Error scraping {url}: {e}")
+                return []
 
     def find_links(self, soup: BeautifulSoup, base_url: str) -> List[str]:
         """
@@ -219,8 +237,6 @@ class WebScraper:
         Returns:
             List of URLs to scrape
         """
-        from urllib.parse import urljoin, urlparse
-
         links = []
         base_domain = urlparse(base_url).netloc
 
@@ -251,68 +267,106 @@ class WebScraper:
 
         return list(set(links))  # Remove duplicates
 
-    def scrape_website(self, max_pages: int = 10, follow_links: bool = True) -> List[Dict[str, str]]:
+    async def scrape_website(self, max_pages: int = 10, follow_links: bool = True) -> List[Dict[str, str]]:
         """
-        Scrape the website starting from base_url
+        Scrape the website starting from base_url using async/await
 
         Args:
             max_pages: Maximum number of pages to scrape
             follow_links: Whether to follow links to scrape more pages
 
         Returns:
-            List of scraped data dictionaries (multiple entries per page)
+            List of scraped data dictionaries
         """
         all_sections = []
         urls_to_scrape = [self.base_url]
         scraped_urls = set()
-        pages_scraped = 0
 
-        while urls_to_scrape and pages_scraped < max_pages:
-            current_url = urls_to_scrape.pop(0)
+        while urls_to_scrape and len(scraped_urls) < max_pages:
+            # Take a batch of URLs to scrape concurrently
+            batch_size = min(self.max_concurrent, len(urls_to_scrape), max_pages - len(scraped_urls))
+            current_batch = []
 
-            if current_url in scraped_urls:
-                continue
+            for _ in range(batch_size):
+                if urls_to_scrape:
+                    url = urls_to_scrape.pop(0)
+                    if url not in scraped_urls:
+                        current_batch.append(url)
+                        scraped_urls.add(url)
 
-            scraped_urls.add(current_url)
-            pages_scraped += 1
+            if not current_batch:
+                break
 
-            # Scrape the current page
-            logger.info(f"Scraping page {pages_scraped}/{max_pages}: {current_url}")
+            logger.info(f"Processing batch of {len(current_batch)} URLs (Total scraped: {len(scraped_urls)}/{max_pages})")
 
-            try:
-                response = self.session.get(current_url, timeout=10)
-                response.raise_for_status()
-                soup = BeautifulSoup(response.content, 'html.parser')
+            # Create tasks for concurrent scraping
+            tasks = []
+            for url in current_batch:
+                task = asyncio.create_task(self.scrape_page_with_links(url, follow_links))
+                tasks.append(task)
 
-                # Get page sections (now returns a list)
-                page_sections = self.scrape_page(current_url)
-                if page_sections:
-                    all_sections.extend(page_sections)
-                    logger.info(f"Added {len(page_sections)} sections from {current_url}")
+            # Wait for all tasks in the batch to complete
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                # Find more links to scrape if we need more pages and follow_links is True
-                if follow_links and pages_scraped < max_pages:
-                    new_links = self.find_links(soup, current_url)
+            # Process results
+            for result in batch_results:
+                if isinstance(result, Exception):
+                    logger.error(f"Task failed: {result}")
+                    continue
 
-                    # Add new links that we haven't scraped yet
+                sections, new_links = result
+                if sections:
+                    all_sections.extend(sections)
+
+                # Add new links for future batches
+                if follow_links and len(scraped_urls) < max_pages:
                     for link in new_links:
                         if link not in scraped_urls and link not in urls_to_scrape:
                             urls_to_scrape.append(link)
 
-                    logger.info(f"Found {len(new_links)} links, {len(urls_to_scrape)} in queue")
-
-            except Exception as e:
-                logger.error(f"Error scraping {current_url}: {e}")
-                continue
-
-            # Add delay between requests
-            time.sleep(self.delay)
-
-        logger.info(f"Scraping completed. Pages scraped: {pages_scraped}, Total sections: {len(all_sections)}")
+        logger.info(f"Scraping completed. Pages scraped: {len(scraped_urls)}, Total sections: {len(all_sections)}")
         return all_sections
 
-def main():
-    parser = argparse.ArgumentParser(description='Web Scraper for AI Training Data')
+    async def scrape_page_with_links(self, url: str, follow_links: bool) -> tuple:
+        """
+        Scrape a page and return both sections and links
+
+        Returns:
+            Tuple of (sections, links)
+        """
+        async with self.semaphore:
+            try:
+                async with self.session.get(url) as response:
+                    response.raise_for_status()
+                    content = await response.read()
+
+                soup = BeautifulSoup(content, 'html.parser')
+
+                # Remove unwanted elements
+                for script in soup(["script", "style", "nav", "footer", "header"]):
+                    script.decompose()
+
+                # Extract title
+                title = soup.find('title')
+                title_text = title.get_text().strip() if title else ""
+
+                # Extract sections
+                sections = self.extract_sections(soup, url, title_text)
+
+                # Extract links if needed
+                links = []
+                if follow_links:
+                    links = self.find_links(soup, url)
+
+                await asyncio.sleep(self.delay)
+                return sections, links
+
+            except Exception as e:
+                logger.error(f"Error scraping {url}: {e}")
+                return [], []
+
+async def main():
+    parser = argparse.ArgumentParser(description='Async Web Scraper for AI Training Data')
     parser.add_argument('url', help='Website URL to scrape')
     parser.add_argument('-o', '--output', default='scraped_data.csv',
                        help='Output CSV file name (default: scraped_data.csv)')
@@ -320,8 +374,10 @@ def main():
                        help='Maximum number of pages to scrape (default: 1)')
     parser.add_argument('-d', '--delay', type=float, default=1.0,
                        help='Delay between requests in seconds (default: 1.0)')
+    parser.add_argument('-c', '--concurrent', type=int, default=20,
+                       help='Maximum concurrent requests (default: 20)')
     parser.add_argument('--no-follow-links', action='store_true',
-                       help='Don\'t follow links to scrape additional pages (default: follow links)')
+                       help='Don\'t follow links to scrape additional pages')
 
     args = parser.parse_args()
 
@@ -332,53 +388,38 @@ def main():
 
     follow_links = not args.no_follow_links and args.pages > 1
 
-    logger.info(f"Starting to scrape: {args.url}")
-    logger.info(f"Output file: {args.output}")
+    logger.info(f"Starting async scraping: {args.url}")
+    logger.info(f"Max concurrent requests: {args.concurrent}")
     logger.info(f"Max pages: {args.pages}")
-    logger.info(f"Follow links: {follow_links}")
 
-    # Initialize scraper
-    scraper = WebScraper(args.url, args.delay)
+    # Use async context manager
+    async with AsyncWebScraper(args.url, args.delay, args.concurrent) as scraper:
+        try:
+            scraped_sections = await scraper.scrape_website(args.pages, follow_links)
 
-    # Scrape the website
-    try:
-        scraped_sections = scraper.scrape_website(args.pages, follow_links)
+            if not scraped_sections:
+                logger.error("No data was scraped successfully")
+                sys.exit(1)
 
-        if not scraped_sections:
-            logger.error("No data was scraped successfully")
+            # Convert to DataFrame and save to CSV
+            df = pd.DataFrame(scraped_sections)
+            df.to_csv(args.output, index=False, encoding='utf-8')
+
+            # Statistics
+            unique_pages = df['url'].nunique()
+            total_sections = len(df)
+            avg_words_per_section = df['word_count'].mean()
+            total_words = df['word_count'].sum()
+
+            print(f"\n📊 Async Scraping Results:")
+            print(f"   Pages scraped: {unique_pages}")
+            print(f"   Total sections: {total_sections}")
+            print(f"   Average words per section: {avg_words_per_section:.0f}")
+            print(f"   Total words: {total_words:,}")
+
+        except Exception as e:
+            logger.error(f"Error during scraping: {e}")
             sys.exit(1)
 
-        # Convert to DataFrame and save to CSV
-        df = pd.DataFrame(scraped_sections)
-        df.to_csv(args.output, index=False, encoding='utf-8')
-
-        # Calculate statistics
-        unique_pages = df['url'].nunique()
-        total_sections = len(df)
-        avg_words_per_section = df['word_count'].mean()
-        total_words = df['word_count'].sum()
-
-        logger.info(f"Successfully scraped {unique_pages} pages with {total_sections} sections")
-        logger.info(f"Data saved to: {args.output}")
-        logger.info(f"DataFrame shape: {df.shape}")
-
-        # Display sample of the data
-        print(f"\n📊 Scraping Results:")
-        print(f"   Pages scraped: {unique_pages}")
-        print(f"   Total sections: {total_sections}")
-        print(f"   Average words per section: {avg_words_per_section:.0f}")
-        print(f"   Total words: {total_words:,}")
-
-        print(f"\n📋 Sample of scraped data:")
-        display_cols = ['page_title', 'section_title', 'content_type', 'word_count']
-        print(df[display_cols].head(10))
-
-        print(f"\n📈 Content type distribution:")
-        print(df['content_type'].value_counts())
-
-    except Exception as e:
-        logger.error(f"Error during scraping: {e}")
-        sys.exit(1)
-
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
